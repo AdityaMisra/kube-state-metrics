@@ -28,9 +28,9 @@ import (
 	"time"
 
 	"k8s.io/kube-state-metrics/internal/store"
+	"k8s.io/kube-state-metrics/pkg/allowdenylist"
 	"k8s.io/kube-state-metrics/pkg/metricshandler"
 	"k8s.io/kube-state-metrics/pkg/options"
-	"k8s.io/kube-state-metrics/pkg/whiteblacklist"
 
 	"github.com/prometheus/client_golang/prometheus"
 	v1 "k8s.io/api/core/v1"
@@ -61,18 +61,18 @@ func BenchmarkKubeStateMetrics(b *testing.B) {
 
 	builder := store.NewBuilder()
 	builder.WithMetrics(reg)
-	builder.WithEnabledResources(options.DefaultCollectors.AsSlice())
+	builder.WithEnabledResources(options.DefaultResources.AsSlice())
 	builder.WithKubeClient(kubeClient)
 	builder.WithSharding(0, 1)
 	builder.WithContext(ctx)
 	builder.WithNamespaces(options.DefaultNamespaces)
 	builder.WithGenerateStoreFunc(builder.DefaultGenerateStoreFunc())
 
-	l, err := whiteblacklist.New(map[string]struct{}{}, map[string]struct{}{})
+	l, err := allowdenylist.New(map[string]struct{}{}, map[string]struct{}{})
 	if err != nil {
 		b.Fatal(err)
 	}
-	builder.WithWhiteBlackList(l)
+	builder.WithAllowDenyList(l)
 
 	// This test is not suitable to be compared in terms of time, as it includes
 	// a one second wait. Use for memory allocation comparisons, profiling, ...
@@ -126,16 +126,16 @@ func TestFullScrapeCycle(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	builder := store.NewBuilder()
 	builder.WithMetrics(reg)
-	builder.WithEnabledResources(options.DefaultCollectors.AsSlice())
+	builder.WithEnabledResources(options.DefaultResources.AsSlice())
 	builder.WithKubeClient(kubeClient)
 	builder.WithNamespaces(options.DefaultNamespaces)
 	builder.WithGenerateStoreFunc(builder.DefaultGenerateStoreFunc())
 
-	l, err := whiteblacklist.New(map[string]struct{}{}, map[string]struct{}{})
+	l, err := allowdenylist.New(map[string]struct{}{}, map[string]struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	builder.WithWhiteBlackList(l)
+	builder.WithAllowDenyList(l)
 
 	handler := metricshandler.New(&options.Options{}, kubeClient, builder, false)
 	handler.ConfigureSharding(ctx, 0, 1)
@@ -157,9 +157,11 @@ func TestFullScrapeCycle(t *testing.T) {
 
 	expected := `# HELP kube_pod_info Information about pod.
 # TYPE kube_pod_info gauge
-kube_pod_info{namespace="default",pod="pod0",host_ip="1.1.1.1",pod_ip="1.2.3.4",uid="abc-0",node="node1",created_by_kind="<none>",created_by_name="<none>",priority_class=""} 1
+kube_pod_info{namespace="default",pod="pod0",host_ip="1.1.1.1",pod_ip="1.2.3.4",uid="abc-0",node="node1",created_by_kind="<none>",created_by_name="<none>",priority_class="",host_network="false"} 1
 # HELP kube_pod_start_time Start time in unix timestamp for a pod.
 # TYPE kube_pod_start_time gauge
+# HELP kube_pod_container_state_started Start time in unix timestamp for a pod container.
+# TYPE kube_pod_container_state_started gauge
 # HELP kube_pod_completion_time Completion time in unix timestamp for a pod.
 # TYPE kube_pod_completion_time gauge
 # HELP kube_pod_owner Information about the Pod's owner.
@@ -171,24 +173,31 @@ kube_pod_labels{namespace="default",pod="pod0"} 1
 # HELP kube_pod_created Unix creation timestamp
 # TYPE kube_pod_created gauge
 kube_pod_created{namespace="default",pod="pod0"} 1.5e+09
+# HELP kube_pod_deletion_timestamp Unix deletion timestamp
+# TYPE kube_pod_deletion_timestamp gauge
 # HELP kube_pod_restart_policy Describes the restart policy in use by this pod.
 # TYPE kube_pod_restart_policy gauge
 kube_pod_restart_policy{namespace="default",pod="pod0",type="Always"} 1
 # HELP kube_pod_status_scheduled_time Unix timestamp when pod moved into scheduled status
 # TYPE kube_pod_status_scheduled_time gauge
-# HELP kube_pod_status_phase The pods current phase.
-# TYPE kube_pod_status_phase gauge
 # HELP kube_pod_status_unschedulable Describes the unschedulable status for the pod.
 # TYPE kube_pod_status_unschedulable gauge
+# HELP kube_pod_status_phase The pods current phase.
+# TYPE kube_pod_status_phase gauge
 kube_pod_status_phase{namespace="default",pod="pod0",phase="Pending"} 0
 kube_pod_status_phase{namespace="default",pod="pod0",phase="Succeeded"} 0
 kube_pod_status_phase{namespace="default",pod="pod0",phase="Failed"} 0
-kube_pod_status_phase{namespace="default",pod="pod0",phase="Running"} 1
 kube_pod_status_phase{namespace="default",pod="pod0",phase="Unknown"} 0
+kube_pod_status_phase{namespace="default",pod="pod0",phase="Running"} 1
 # HELP kube_pod_status_ready Describes whether the pod is ready to serve requests.
 # TYPE kube_pod_status_ready gauge
 # HELP kube_pod_status_scheduled Describes the status of the scheduling process for the pod.
 # TYPE kube_pod_status_scheduled gauge
+# HELP kube_pod_status_reason The pod status reasons
+# TYPE kube_pod_status_reason gauge
+kube_pod_status_reason{namespace="default",pod="pod0",reason="NodeLost"} 0
+kube_pod_status_reason{namespace="default",pod="pod0",reason="Evicted"} 0
+kube_pod_status_reason{namespace="default",pod="pod0",reason="UnexpectedAdmissionError"} 0
 # HELP kube_pod_container_info Information about a container in a pod.
 # TYPE kube_pod_container_info gauge
 kube_pod_container_info{namespace="default",pod="pod0",container="container2",image="k8s.gcr.io/hyperkube2",image_id="docker://sha256:bbb",container_id="docker://cd456"} 1
@@ -236,15 +245,15 @@ kube_pod_container_status_terminated{namespace="default",pod="pod0",container="c
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="OOMKilled"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Completed"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Error"} 0
-kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Evicted"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="ContainerCannotRun"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="DeadlineExceeded"} 0
+kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Evicted"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="OOMKilled"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Completed"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Error"} 0
-kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Evicted"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="ContainerCannotRun"} 0
 kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="DeadlineExceeded"} 0
+kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Evicted"} 0
 # HELP kube_pod_init_container_status_terminated_reason Describes the reason the init container is currently in terminated state.
 # TYPE kube_pod_init_container_status_terminated_reason gauge
 # HELP kube_pod_container_status_last_terminated_reason Describes the last reason the container was in terminated state.
@@ -252,15 +261,15 @@ kube_pod_container_status_terminated_reason{namespace="default",pod="pod0",conta
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="OOMKilled"} 1
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Completed"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Error"} 0
-kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Evicted"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="ContainerCannotRun"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="DeadlineExceeded"} 0
+kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container2",reason="Evicted"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="OOMKilled"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Completed"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Error"} 0
-kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Evicted"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="ContainerCannotRun"} 0
 kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="DeadlineExceeded"} 0
+kube_pod_container_status_last_terminated_reason{namespace="default",pod="pod0",container="container3",reason="Evicted"} 0
 # HELP kube_pod_init_container_status_last_terminated_reason Describes the last reason the init container was in terminated state.
 # TYPE kube_pod_init_container_status_last_terminated_reason gauge
 # HELP kube_pod_container_status_ready Describes whether the containers readiness check succeeded.
@@ -275,46 +284,69 @@ kube_pod_container_status_restarts_total{namespace="default",pod="pod0",containe
 kube_pod_container_status_restarts_total{namespace="default",pod="pod0",container="container3"} 0
 # HELP kube_pod_init_container_status_restarts_total The number of restarts for the init container.
 # TYPE kube_pod_init_container_status_restarts_total counter
+# HELP kube_pod_container_resource_requests_cpu_cores The number of CPU cores requested by a container.
+# TYPE kube_pod_container_resource_requests_cpu_cores gauge
+kube_pod_container_resource_requests_cpu_cores{namespace="default",pod="pod0",container="pod1_con1"} 0.2
+kube_pod_container_resource_requests_cpu_cores{namespace="default",pod="pod0",container="pod1_con2"} 0.3
+# HELP kube_pod_container_resource_requests_memory_bytes Bytes of memory requested by a container.
+# TYPE kube_pod_container_resource_requests_memory_bytes gauge
+kube_pod_container_resource_requests_memory_bytes{namespace="default",pod="pod0",container="pod1_con1"} 1e+08
+kube_pod_container_resource_requests_memory_bytes{namespace="default",pod="pod0",container="pod1_con2"} 2e+08
+# HELP kube_pod_container_resource_requests_storage_bytes Bytes of storage requested by a container.
+# TYPE kube_pod_container_resource_requests_storage_bytes gauge
+kube_pod_container_resource_requests_storage_bytes{namespace="default",pod="pod0",container="pod1_con1"} 4e+08
+# HELP kube_pod_container_resource_requests_ephemeral_storage_bytes Bytes of ephemeral-storage requested by a container.
+# TYPE kube_pod_container_resource_requests_ephemeral_storage_bytes gauge
+kube_pod_container_resource_requests_ephemeral_storage_bytes{namespace="default",pod="pod0",container="pod1_con1"} 3e+08
 # HELP kube_pod_container_resource_requests The number of requested request resource by a container.
 # TYPE kube_pod_container_resource_requests gauge
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="nvidia_com_gpu",unit="integer"} 1
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="cpu",unit="core"} 0.2
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="memory",unit="byte"} 1e+08
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="ephemeral_storage",unit="byte"} 3e+08
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="storage",unit="byte"} 4e+08
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con2",node="node1",resource="cpu",unit="core"} 0.3
-kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con2",node="node1",resource="memory",unit="byte"} 2e+08
-# HELP kube_pod_init_container_resource_limits The number of requested limit resource by the init container.
-# TYPE kube_pod_init_container_resource_limits gauge
+kube_pod_container_resource_requests{namespace="default",pod="pod0",container="pod1_con1",resource="nvidia_com_gpu",unit="integer"} 1
+# HELP kube_pod_container_resource_limits_cpu_cores The number of CPU cores requested limit by a container.
+# TYPE kube_pod_container_resource_limits_cpu_cores gauge
+kube_pod_container_resource_limits_cpu_cores{namespace="default",pod="pod0",container="pod1_con1"} 0.2
+kube_pod_container_resource_limits_cpu_cores{namespace="default",pod="pod0",container="pod1_con2"} 0.3
+# HELP kube_pod_container_resource_limits_memory_bytes Bytes of memory requested limit by a container.
+# TYPE kube_pod_container_resource_limits_memory_bytes gauge
+kube_pod_container_resource_limits_memory_bytes{namespace="default",pod="pod0",container="pod1_con1"} 1e+08
+kube_pod_container_resource_limits_memory_bytes{namespace="default",pod="pod0",container="pod1_con2"} 2e+08
+# HELP kube_pod_container_resource_limits_storage_bytes Bytes of storage requested limit by a container.
+# TYPE kube_pod_container_resource_limits_storage_bytes gauge
+kube_pod_container_resource_limits_storage_bytes{namespace="default",pod="pod0",container="pod1_con1"} 4e+08
+# HELP kube_pod_container_resource_limits_ephemeral_storage_bytes Bytes of ephemeral-storage requested limit by a container.
+# TYPE kube_pod_container_resource_limits_ephemeral_storage_bytes gauge
+kube_pod_container_resource_limits_ephemeral_storage_bytes{namespace="default",pod="pod0",container="pod1_con1"} 3e+08
 # HELP kube_pod_container_resource_limits The number of requested limit resource by a container.
 # TYPE kube_pod_container_resource_limits gauge
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="nvidia_com_gpu",unit="integer"} 1
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="cpu",unit="core"} 0.2
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="memory",unit="byte"} 1e+08
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="ephemeral_storage",unit="byte"} 3e+08
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con1",node="node1",resource="storage",unit="byte"} 4e+08
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con2",node="node1",resource="memory",unit="byte"} 2e+08
-kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con2",node="node1",resource="cpu",unit="core"} 0.3
-# HELP kube_pod_container_resource_requests_cpu_cores The number of requested cpu cores by a container.
-# TYPE kube_pod_container_resource_requests_cpu_cores gauge
-kube_pod_container_resource_requests_cpu_cores{namespace="default",pod="pod0",container="pod1_con1",node="node1"} 0.2
-kube_pod_container_resource_requests_cpu_cores{namespace="default",pod="pod0",container="pod1_con2",node="node1"} 0.3
-# HELP kube_pod_container_resource_requests_memory_bytes The number of requested memory bytes by a container.
-# TYPE kube_pod_container_resource_requests_memory_bytes gauge
-kube_pod_container_resource_requests_memory_bytes{namespace="default",pod="pod0",container="pod1_con1",node="node1"} 1e+08
-kube_pod_container_resource_requests_memory_bytes{namespace="default",pod="pod0",container="pod1_con2",node="node1"} 2e+08
-# HELP kube_pod_container_resource_limits_cpu_cores The limit on cpu cores to be used by a container.
-# TYPE kube_pod_container_resource_limits_cpu_cores gauge
-kube_pod_container_resource_limits_cpu_cores{namespace="default",pod="pod0",container="pod1_con1",node="node1"} 0.2
-kube_pod_container_resource_limits_cpu_cores{namespace="default",pod="pod0",container="pod1_con2",node="node1"} 0.3
-# HELP kube_pod_container_resource_limits_memory_bytes The limit on memory to be used by a container in bytes.
-# TYPE kube_pod_container_resource_limits_memory_bytes gauge
-kube_pod_container_resource_limits_memory_bytes{namespace="default",pod="pod0",container="pod1_con1",node="node1"} 1e+08
-kube_pod_container_resource_limits_memory_bytes{namespace="default",pod="pod0",container="pod1_con2",node="node1"} 2e+08
+kube_pod_container_resource_limits{namespace="default",pod="pod0",container="pod1_con1",resource="nvidia_com_gpu",unit="integer"} 1
+# HELP kube_pod_init_container_resource_requests_cpu_cores The number of CPU cores requested by an init container.
+# TYPE kube_pod_init_container_resource_requests_cpu_cores gauge
+# HELP kube_pod_init_container_resource_requests_memory_bytes Bytes of memory requested by an init container.
+# TYPE kube_pod_init_container_resource_requests_memory_bytes gauge
+# HELP kube_pod_init_container_resource_requests_storage_bytes Bytes of storage requested by an init container.
+# TYPE kube_pod_init_container_resource_requests_storage_bytes gauge
+# HELP kube_pod_init_container_resource_requests_ephemeral_storage_bytes Bytes of ephemeral-storage requested by an init container.
+# TYPE kube_pod_init_container_resource_requests_ephemeral_storage_bytes gauge
+# HELP kube_pod_init_container_resource_requests The number of requested request resource by an init container.
+# TYPE kube_pod_init_container_resource_requests gauge
+# HELP kube_pod_init_container_resource_limits_cpu_cores The number of CPU cores requested limit by an init container.
+# TYPE kube_pod_init_container_resource_limits_cpu_cores gauge
+# HELP kube_pod_init_container_resource_limits_memory_bytes Bytes of memory requested limit by an init container.
+# TYPE kube_pod_init_container_resource_limits_memory_bytes gauge
+# HELP kube_pod_init_container_resource_limits_storage_bytes Bytes of storage requested limit by an init container.
+# TYPE kube_pod_init_container_resource_limits_storage_bytes gauge
+# HELP kube_pod_init_container_resource_limits_ephemeral_storage_bytes Bytes of ephemeral-storage requested limit by an init container.
+# TYPE kube_pod_init_container_resource_limits_ephemeral_storage_bytes gauge
+# HELP kube_pod_init_container_resource_limits The number of requested limit resource by an init container.
+# TYPE kube_pod_init_container_resource_limits gauge
 # HELP kube_pod_spec_volumes_persistentvolumeclaims_info Information about persistentvolumeclaim volumes in a pod.
 # TYPE kube_pod_spec_volumes_persistentvolumeclaims_info gauge
 # HELP kube_pod_spec_volumes_persistentvolumeclaims_readonly Describes whether a persistentvolumeclaim is mounted read only.
-# TYPE kube_pod_spec_volumes_persistentvolumeclaims_readonly gauge`
+# TYPE kube_pod_spec_volumes_persistentvolumeclaims_readonly gauge
+# HELP kube_pod_overhead_cpu_cores The pod overhead in regards to cpu cores associated with running a pod.
+# TYPE kube_pod_overhead_cpu_cores gauge
+# HELP kube_pod_overhead_memory_bytes The pod overhead in regards to memory associated with running a pod.
+# TYPE kube_pod_overhead_memory_bytes gauge
+`
 
 	expectedSplit := strings.Split(strings.TrimSpace(expected), "\n")
 	sort.Strings(expectedSplit)
@@ -331,7 +363,7 @@ kube_pod_container_resource_limits_memory_bytes{namespace="default",pod="pod0",c
 	sort.Strings(gotFiltered)
 
 	if len(expectedSplit) != len(gotFiltered) {
-		t.Fatalf("expected different output length, expected %d got %d", len(expectedSplit), len(gotFiltered))
+		t.Fatalf("expected different output length, expected \n\n%s\n\ngot\n\n%s", expected, string(body))
 	}
 
 	for i := 0; i < len(expectedSplit); i++ {
@@ -357,7 +389,7 @@ func TestShardingEquivalenceScrapeCycle(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	l, err := whiteblacklist.New(map[string]struct{}{}, map[string]struct{}{})
+	l, err := allowdenylist.New(map[string]struct{}{}, map[string]struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,10 +397,10 @@ func TestShardingEquivalenceScrapeCycle(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	unshardedBuilder := store.NewBuilder()
 	unshardedBuilder.WithMetrics(reg)
-	unshardedBuilder.WithEnabledResources(options.DefaultCollectors.AsSlice())
+	unshardedBuilder.WithEnabledResources(options.DefaultResources.AsSlice())
 	unshardedBuilder.WithKubeClient(kubeClient)
 	unshardedBuilder.WithNamespaces(options.DefaultNamespaces)
-	unshardedBuilder.WithWhiteBlackList(l)
+	unshardedBuilder.WithAllowDenyList(l)
 	unshardedBuilder.WithGenerateStoreFunc(unshardedBuilder.DefaultGenerateStoreFunc())
 
 	unshardedHandler := metricshandler.New(&options.Options{}, kubeClient, unshardedBuilder, false)
@@ -377,10 +409,10 @@ func TestShardingEquivalenceScrapeCycle(t *testing.T) {
 	regShard1 := prometheus.NewRegistry()
 	shardedBuilder1 := store.NewBuilder()
 	shardedBuilder1.WithMetrics(regShard1)
-	shardedBuilder1.WithEnabledResources(options.DefaultCollectors.AsSlice())
+	shardedBuilder1.WithEnabledResources(options.DefaultResources.AsSlice())
 	shardedBuilder1.WithKubeClient(kubeClient)
 	shardedBuilder1.WithNamespaces(options.DefaultNamespaces)
-	shardedBuilder1.WithWhiteBlackList(l)
+	shardedBuilder1.WithAllowDenyList(l)
 	shardedBuilder1.WithGenerateStoreFunc(shardedBuilder1.DefaultGenerateStoreFunc())
 
 	shardedHandler1 := metricshandler.New(&options.Options{}, kubeClient, shardedBuilder1, false)
@@ -389,10 +421,10 @@ func TestShardingEquivalenceScrapeCycle(t *testing.T) {
 	regShard2 := prometheus.NewRegistry()
 	shardedBuilder2 := store.NewBuilder()
 	shardedBuilder2.WithMetrics(regShard2)
-	shardedBuilder2.WithEnabledResources(options.DefaultCollectors.AsSlice())
+	shardedBuilder2.WithEnabledResources(options.DefaultResources.AsSlice())
 	shardedBuilder2.WithKubeClient(kubeClient)
 	shardedBuilder2.WithNamespaces(options.DefaultNamespaces)
-	shardedBuilder2.WithWhiteBlackList(l)
+	shardedBuilder2.WithAllowDenyList(l)
 	shardedBuilder2.WithGenerateStoreFunc(shardedBuilder2.DefaultGenerateStoreFunc())
 
 	shardedHandler2 := metricshandler.New(&options.Options{}, kubeClient, shardedBuilder2, false)
@@ -531,7 +563,7 @@ func configMap(client *fake.Clientset, index int) error {
 			UID:             types.UID("abc-" + i),
 		},
 	}
-	_, err := client.CoreV1().ConfigMaps(metav1.NamespaceDefault).Create(&configMap)
+	_, err := client.CoreV1().ConfigMaps(metav1.NamespaceDefault).Create(context.TODO(), &configMap, metav1.CreateOptions{})
 	return err
 }
 
@@ -545,7 +577,7 @@ func service(client *fake.Clientset, index int) error {
 			UID:             types.UID("abc-" + i),
 		},
 	}
-	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(&service)
+	_, err := client.CoreV1().Services(metav1.NamespaceDefault).Create(context.TODO(), &service, metav1.CreateOptions{})
 	return err
 }
 
@@ -628,6 +660,6 @@ func pod(client *fake.Clientset, index int) error {
 		},
 	}
 
-	_, err := client.CoreV1().Pods(metav1.NamespaceDefault).Create(&pod)
+	_, err := client.CoreV1().Pods(metav1.NamespaceDefault).Create(context.TODO(), &pod, metav1.CreateOptions{})
 	return err
 }

@@ -1,3 +1,30 @@
+## v1.9.7 / 2020-05-24
+
+* [BUGFIX] internal/store/mutatingwebhookconfiguration.go: Switch to v1 #1144
+
+## v1.9.6 / 2020-05-06
+
+* [BUGFIX] Fix VolumeAttachment API version mismatch: expected v1 but watching v1beta1 #1136
+
+## v1.9.5 / 2020-02-20
+
+* [BUGFIX] Switch to using only v1 client of validatingwebhookconfiguration #1052
+
+## v1.9.4 / 2020-02-03
+
+* [BUGFIX] Fix VolumeAttachment api version to be used (was v1beta1, should have been v1). #1043
+* [BUGFIX] Fix MutatingWebhookConfiguration api version to be used (was v1beta1, should have been v1). #1043
+* [BUGFIX] Fix ValidatingWebhookConfiguration api version to be used (was v1beta1, should have been v1). #1043
+* [BUGFIX] Use the correct for NetworkPolicy reflector. #1042
+
+## v1.9.3 / 2020-01-22
+
+* [CHANGE] Remove experimental hpa metrics kube_hpa_status_current_metrics_average_utilization and kube_hpa_status_current_metrics_average_value #1030
+
+## v1.9.2 / 2020-01-13
+
+* [BUGFIX] Fix segfault with External metrics #1023
+
 ## v1.9.1 / 2020-01-10
 
 * [BUGFIX] Fix segfault in hpa metrics #1019

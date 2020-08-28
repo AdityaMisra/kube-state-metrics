@@ -19,13 +19,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"strconv"
+	"time"
 
+	"github.com/oklog/run"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -36,11 +37,11 @@ import (
 	"k8s.io/klog"
 
 	"k8s.io/kube-state-metrics/internal/store"
+	"k8s.io/kube-state-metrics/pkg/allowdenylist"
 	"k8s.io/kube-state-metrics/pkg/metricshandler"
 	"k8s.io/kube-state-metrics/pkg/options"
 	"k8s.io/kube-state-metrics/pkg/util/proc"
 	"k8s.io/kube-state-metrics/pkg/version"
-	"k8s.io/kube-state-metrics/pkg/whiteblacklist"
 )
 
 const (
@@ -59,8 +60,7 @@ func main() {
 	opts := options.NewOptions()
 	opts.AddFlags()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
 	err := opts.Parse()
 	if err != nil {
@@ -81,17 +81,17 @@ func main() {
 	ksmMetricsRegistry := prometheus.NewRegistry()
 	storeBuilder.WithMetrics(ksmMetricsRegistry)
 
-	var collectors []string
-	if len(opts.Collectors) == 0 {
-		klog.Info("Using default collectors")
-		collectors = options.DefaultCollectors.AsSlice()
+	var resources []string
+	if len(opts.Resources) == 0 {
+		klog.Info("Using default resources")
+		resources = options.DefaultResources.AsSlice()
 	} else {
-		klog.Infof("Using collectors %s", opts.Collectors.String())
-		collectors = opts.Collectors.AsSlice()
+		klog.Infof("Using resources %s", opts.Resources.String())
+		resources = opts.Resources.AsSlice()
 	}
 
-	if err := storeBuilder.WithEnabledResources(collectors); err != nil {
-		klog.Fatalf("Failed to set up collectors: %v", err)
+	if err := storeBuilder.WithEnabledResources(resources); err != nil {
+		klog.Fatalf("Failed to set up resources: %v", err)
 	}
 
 	if len(opts.Namespaces) == 0 {
@@ -106,39 +106,19 @@ func main() {
 		storeBuilder.WithNamespaces(opts.Namespaces)
 	}
 
-	whiteBlackList, err := whiteblacklist.New(opts.MetricWhitelist, opts.MetricBlacklist)
+	allowDenyList, err := allowdenylist.New(opts.MetricAllowlist, opts.MetricDenylist)
 	if err != nil {
 		klog.Fatal(err)
 	}
 
-	if opts.DisablePodNonGenericResourceMetrics {
-		whiteBlackList.Exclude([]string{
-			"kube_pod_container_resource_requests_cpu_cores",
-			"kube_pod_container_resource_requests_memory_bytes",
-			"kube_pod_container_resource_limits_cpu_cores",
-			"kube_pod_container_resource_limits_memory_bytes",
-		})
-	}
-
-	if opts.DisableNodeNonGenericResourceMetrics {
-		whiteBlackList.Exclude([]string{
-			"kube_node_status_capacity_cpu_cores",
-			"kube_node_status_capacity_memory_bytes",
-			"kube_node_status_capacity_pods",
-			"kube_node_status_allocatable_cpu_cores",
-			"kube_node_status_allocatable_memory_bytes",
-			"kube_node_status_allocatable_pods",
-		})
-	}
-
-	err = whiteBlackList.Parse()
+	err = allowDenyList.Parse()
 	if err != nil {
-		klog.Fatalf("error initializing the whiteblack list : %v", err)
+		klog.Fatalf("error initializing the allowdeny list : %v", err)
 	}
 
-	klog.Infof("metric white-blacklisting: %v", whiteBlackList.Status())
+	klog.Infof("metric allow-denylisting: %v", allowDenyList.Status())
 
-	storeBuilder.WithWhiteBlackList(whiteBlackList)
+	storeBuilder.WithAllowDenyList(allowDenyList)
 
 	storeBuilder.WithGenerateStoreFunc(storeBuilder.DefaultGenerateStoreFunc())
 
@@ -156,9 +136,67 @@ func main() {
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 		prometheus.NewGoCollector(),
 	)
-	go telemetryServer(ksmMetricsRegistry, opts.TelemetryHost, opts.TelemetryPort)
 
-	serveMetrics(ctx, kubeClient, storeBuilder, opts, opts.Host, opts.Port, opts.EnableGZIPEncoding)
+	var g run.Group
+
+	m := metricshandler.New(
+		opts,
+		kubeClient,
+		storeBuilder,
+		opts.EnableGZIPEncoding,
+	)
+	// Run MetricsHandler
+	{
+		ctxMetricsHandler, cancel := context.WithCancel(ctx)
+		g.Add(func() error {
+			return m.Run(ctxMetricsHandler)
+		}, func(error) {
+			cancel()
+		})
+	}
+
+	telemetryMux := buildTelemetryServer(ksmMetricsRegistry)
+	telemetryServer := http.Server{Handler: telemetryMux}
+	telemetryListenAddress := net.JoinHostPort(opts.TelemetryHost, strconv.Itoa(opts.TelemetryPort))
+	telemetryLn, err := net.Listen("tcp", telemetryListenAddress)
+	if err != nil {
+		klog.Fatalf("Failed to create Telemetry Listener: %v", err)
+	}
+	metricsMux := buildMetricsServer(kubeClient, storeBuilder, m, opts)
+	metricsServer := http.Server{Handler: metricsMux}
+	metricsServerListenAddress := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
+	metricsServerLn, err := net.Listen("tcp", metricsServerListenAddress)
+	if err != nil {
+		klog.Fatalf("Failed to create MetricsServer Listener: %v", err)
+	}
+
+	// Run Telemetry server
+	{
+		g.Add(func() error {
+			klog.Infof("Starting kube-state-metrics self metrics server: %s", telemetryListenAddress)
+			return telemetryServer.Serve(telemetryLn)
+		}, func(error) {
+			ctxShutDown, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			telemetryServer.Shutdown(ctxShutDown)
+		})
+	}
+	// Run Metrics server
+	{
+		g.Add(func() error {
+			klog.Infof("Starting metrics server: %s", metricsServerListenAddress)
+			return metricsServer.Serve(metricsServerLn)
+		}, func(error) {
+			ctxShutDown, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			metricsServer.Shutdown(ctxShutDown)
+		})
+	}
+
+	if err := g.Run(); err != nil {
+		klog.Fatalf("RunGroup Error: %v", err)
+	}
+	klog.Info("Exiting")
 }
 
 func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface, vpaclientset.Interface, error) {
@@ -195,12 +233,7 @@ func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface,
 	return kubeClient, vpaClient, nil
 }
 
-func telemetryServer(registry prometheus.Gatherer, host string, port int) {
-	// Address to listen on for web interface and telemetry
-	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
-
-	klog.Infof("Starting kube-state-metrics self metrics server: %s", listenAddress)
-
+func buildTelemetryServer(registry prometheus.Gatherer) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Add metricsPath
@@ -217,15 +250,10 @@ func telemetryServer(registry prometheus.Gatherer, host string, port int) {
              </body>
              </html>`))
 	})
-	log.Fatal(http.ListenAndServe(listenAddress, mux))
+	return mux
 }
 
-func serveMetrics(ctx context.Context, kubeClient clientset.Interface, storeBuilder *store.Builder, opts *options.Options, host string, port int, enableGZIPEncoding bool) {
-	// Address to listen on for web interface and telemetry
-	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
-
-	klog.Infof("Starting metrics server: %s", listenAddress)
-
+func buildMetricsServer(kubeClient clientset.Interface, storeBuilder *store.Builder, m *metricshandler.MetricsHandler, opts *options.Options) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// TODO: This doesn't belong into serveMetrics
@@ -235,13 +263,6 @@ func serveMetrics(ctx context.Context, kubeClient clientset.Interface, storeBuil
 	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
 	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 
-	m := metricshandler.New(
-		opts,
-		kubeClient,
-		storeBuilder,
-		enableGZIPEncoding,
-	)
-	go m.Run(ctx)
 	mux.Handle(metricsPath, m)
 
 	// Add healthzPath
@@ -262,5 +283,5 @@ func serveMetrics(ctx context.Context, kubeClient clientset.Interface, storeBuil
              </body>
              </html>`))
 	})
-	log.Fatal(http.ListenAndServe(listenAddress, mux))
+	return mux
 }
